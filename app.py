@@ -1,6 +1,5 @@
 import os
 import secrets
-import fcntl
 from datetime import timedelta
 from flask import Flask
 from flask_cors import CORS
@@ -16,22 +15,52 @@ from configs.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def _lock_file(file_obj):
+    """独占锁定已打开的文件。Windows 没有 fcntl，改用 msvcrt。"""
+    file_obj.seek(0)
+    file_obj.flush()
+    fd = file_obj.fileno()
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _unlock_file(file_obj):
+    file_obj.flush()
+    fd = file_obj.fileno()
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def _load_or_create_secret(data_dir):
     """为零配置部署生成可持久化的随机会话密钥。"""
     secret_path = os.path.join(data_dir, ".secret_key")
     try:
         descriptor = os.open(secret_path, os.O_RDWR | os.O_CREAT, 0o600)
         with os.fdopen(descriptor, "r+", encoding="utf-8") as secret_file:
-            fcntl.flock(secret_file.fileno(), fcntl.LOCK_EX)
-            saved = secret_file.read().strip()
-            if saved:
-                return saved
-            generated = secrets.token_hex(32)
-            secret_file.seek(0)
-            secret_file.write(generated)
-            secret_file.flush()
-            os.fsync(secret_file.fileno())
-            return generated
+            _lock_file(secret_file)
+            try:
+                secret_file.seek(0)
+                saved = secret_file.read().strip()
+                if saved:
+                    return saved
+                generated = secrets.token_hex(32)
+                secret_file.seek(0)
+                secret_file.write(generated)
+                secret_file.flush()
+                os.fsync(secret_file.fileno())
+                return generated
+            finally:
+                _unlock_file(secret_file)
     except (PermissionError, OSError) as e:
         logger.warning(f"无法读写密钥文件 {secret_path}，使用临时随机会话密钥: {e}")
         return secrets.token_hex(32)
